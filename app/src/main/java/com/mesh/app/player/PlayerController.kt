@@ -72,7 +72,7 @@ class PlayerController(context: Context) {
         val state = _playerState.value
         if (state.queue.isEmpty()) return
         val newIndex = (state.queueIndex + 1).coerceAtMost(state.queue.lastIndex)
-        if (newIndex == state.queueIndex && exoPlayer.isPlaying) {
+        if (newIndex == state.queueIndex) {
             exoPlayer.pause()
             _playerState.update { it.copy(isPlaying = false) }
             return

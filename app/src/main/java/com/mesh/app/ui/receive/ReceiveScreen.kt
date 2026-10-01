@@ -72,7 +72,7 @@ fun ReceiveScreen(
     }
 
     BackHandler {
-        viewModel.onLeave()
+        viewModel.disconnect()
         onBack()
     }
 
@@ -83,7 +83,7 @@ fun ReceiveScreen(
                 navigationIcon = {
                     IconButton(
                         onClick = {
-                            viewModel.onLeave()
+                            viewModel.disconnect()
                             onBack()
                         },
                     ) {

@@ -4,8 +4,8 @@ import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.mesh.app.data.repository.TrackRepository
-import com.mesh.app.library.ImportBatchResult
 import com.mesh.app.library.ImportFailure
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -24,15 +24,20 @@ class HomeViewModel(
     val uiState: StateFlow<HomeUiState> = _uiState.asStateFlow()
 
     fun importTracks(uris: List<Uri>) {
-        if (uris.isEmpty()) return
+        if (uris.isEmpty() || _uiState.value.isImporting) return
+        _uiState.update { it.copy(isImporting = true) }
         viewModelScope.launch {
-            _uiState.update { it.copy(isImporting = true) }
-            val result: ImportBatchResult = trackRepository.importTracks(uris)
-            _uiState.update {
-                it.copy(
-                    isImporting = false,
-                    importFailures = result.failures,
-                )
+            try {
+                val result = trackRepository.importTracks(uris)
+                _uiState.update { it.copy(importFailures = result.failures) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _uiState.update { it.copy(importFailures = listOf(
+                    ImportFailure("Import", e.message ?: "Could not import tracks"),
+                )) }
+            } finally {
+                _uiState.update { it.copy(isImporting = false) }
             }
         }
     }

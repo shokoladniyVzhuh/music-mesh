@@ -25,6 +25,7 @@ sealed class TransferPhase {
     data object WaitingForCatalog : TransferPhase()
     data object ChoosingTracks : TransferPhase()
     data object WaitingForDownloadRequest : TransferPhase()
+    data object WaitingForResult : TransferPhase()
     data class Transferring(
         val completed: Int,
         val total: Int,
@@ -69,10 +70,15 @@ data class TransferSessionState(
             is TransferPhase.WaitingForCatalog,
             is TransferPhase.ChoosingTracks,
             is TransferPhase.WaitingForDownloadRequest,
+            is TransferPhase.WaitingForResult,
             is TransferPhase.Transferring,
             is TransferPhase.Success,
             is TransferPhase.PartialSuccess,
             -> true
             else -> false
         }
+
+    val isTerminal: Boolean
+        get() = phase is TransferPhase.Success || phase is TransferPhase.PartialSuccess ||
+            phase is TransferPhase.Failed
 }

@@ -4,6 +4,21 @@ package com.mesh.app.transfer
  * Pure finish-phase rules for receiver (unit-tested).
  */
 object TransferFinishLogic {
+    fun validateReceiverResult(result: ControlMessage.TransferResult, requested: Int, skippedAtStart: Int) {
+        require(result.transferred >= 0 && result.failed >= 0 && result.skipped >= skippedAtStart) {
+            "Invalid transfer result counts"
+        }
+        require(result.transferred.toLong() + result.failed + result.skipped == requested.toLong() + skippedAtStart) {
+            "Invalid transfer result"
+        }
+    }
+
+    fun receiverCanFinishNormally(
+        processed: Int,
+        totalRequested: Int,
+        inflightImports: Int,
+    ): Boolean = inflightImports == 0 && processed >= totalRequested
+
     fun receiverPhase(
         transferred: Int,
         skipped: Int,

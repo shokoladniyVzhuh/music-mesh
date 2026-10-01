@@ -38,7 +38,11 @@ class TransferViewModel(
 ) : ViewModel() {
     val uiState: StateFlow<TransferUiState> = nearbyManager.state
         .map { TransferUiState(it) }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), TransferUiState())
+        .stateIn(
+            viewModelScope,
+            SharingStarted.WhileSubscribed(5_000),
+            TransferUiState(nearbyManager.state.value),
+        )
 
     fun toggleTrack(trackId: String) {
         nearbyManager.toggleTrackSelection(trackId)
@@ -49,7 +53,7 @@ class TransferViewModel(
     }
 
     fun closeConnection() {
-        nearbyManager.disconnect("Closed by user")
+        nearbyManager.cancelTransfer("Connection closed by you")
     }
 
     fun continueListening() {

@@ -76,7 +76,7 @@ fun SendScreen(
     }
 
     BackHandler {
-        viewModel.onLeave()
+        viewModel.disconnect()
         onBack()
     }
 
@@ -87,7 +87,7 @@ fun SendScreen(
                 navigationIcon = {
                     IconButton(
                         onClick = {
-                            viewModel.onLeave()
+                            viewModel.disconnect()
                             onBack()
                         },
                     ) {
