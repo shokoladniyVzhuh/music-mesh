@@ -1,6 +1,5 @@
 package com.mesh.app.ui.home
 
-import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -22,7 +21,6 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.mesh.app.MeshApplication
 import com.mesh.app.ui.components.ImportErrorsDialog
 import com.mesh.app.ui.components.MeshScreenTitle
-import com.mesh.app.util.PermissionsHelper
 
 @Composable
 fun HomeScreen(
@@ -53,14 +51,6 @@ fun HomeScreen(
         }
     }
 
-    val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions(),
-    ) { results ->
-        if (results.values.all { it }) {
-            pickerLauncher.launch(arrayOf("audio/mpeg", "audio/mp3"))
-        }
-    }
-
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -71,12 +61,9 @@ fun HomeScreen(
         if (uiState.isImporting) {
             CircularProgressIndicator(modifier = Modifier.align(Alignment.CenterHorizontally))
         }
+        // OpenMultipleDocuments grants access to the selected URIs; broad media permission is not needed.
         HomeButton("Add") {
-            if (PermissionsHelper.hasAudioReadPermission(context)) {
-                pickerLauncher.launch(arrayOf("audio/mpeg", "audio/mp3"))
-            } else {
-                permissionLauncher.launch(PermissionsHelper.audioReadPermissions())
-            }
+            pickerLauncher.launch(arrayOf("audio/mpeg", "audio/mp3"))
         }
         HomeButton("Playlists", onPlaylists)
         HomeButton("Downloaded", onDownloaded)

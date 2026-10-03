@@ -6,6 +6,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Button
@@ -29,6 +31,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.mesh.app.MeshApplication
 import com.mesh.app.transfer.TransferPhase
+import com.mesh.app.transfer.TransferRole
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -53,7 +56,6 @@ fun TransferProgressScreen(
             }
             else -> {
                 viewModel.closeConnection()
-                onContinueListening()
             }
         }
     }
@@ -75,7 +77,6 @@ fun TransferProgressScreen(
                                 }
                                 else -> {
                                     viewModel.closeConnection()
-                                    onContinueListening()
                                 }
                             }
                         },
@@ -90,6 +91,7 @@ fun TransferProgressScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
+                .verticalScroll(rememberScrollState())
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
@@ -105,6 +107,9 @@ fun TransferProgressScreen(
                     if (uiState.skippedCount > 0) {
                         Text("${uiState.skippedCount} skipped (already in library)")
                     }
+                    if (uiState.session.failedCount > 0) {
+                        Text("${uiState.session.failedCount} tracks failed")
+                    }
                     LinearProgressIndicator(
                         progress = { phase.currentFilePercent / 100f },
                         modifier = Modifier.fillMaxWidth(),
@@ -114,10 +119,16 @@ fun TransferProgressScreen(
                     TextButton(
                         onClick = {
                             viewModel.closeConnection()
-                            onContinueListening()
                         },
                         modifier = Modifier.fillMaxWidth(),
                     ) {
+                        Text("Close connection")
+                    }
+                }
+                is TransferPhase.WaitingForResult -> {
+                    CircularProgressIndicator(modifier = Modifier.align(Alignment.CenterHorizontally))
+                    Text("Files sent. Waiting for the receiver to confirm saving them…")
+                    TextButton(onClick = viewModel::closeConnection, modifier = Modifier.fillMaxWidth()) {
                         Text("Close connection")
                     }
                 }
@@ -142,11 +153,21 @@ fun TransferProgressScreen(
                 }
                 is TransferPhase.PartialSuccess -> {
                     Text(
-                        text = "Connection closed",
+                        text = "Transfer finished with issues",
                         style = MaterialTheme.typography.headlineSmall,
                     )
                     Text(phase.message)
-                    Text("${phase.transferred} tracks downloaded")
+                    val countText = if (uiState.role == TransferRole.Sender && uiState.session.errorMessage != null) {
+                        "${phase.transferred} files sent; saving was not confirmed. Check the receiver's library."
+                    } else {
+                        "${phase.transferred} tracks saved to the receiver's library"
+                    }
+                    Text(countText)
+                    val total = uiState.session.totalRequested
+                    if (total > 0 && uiState.role == TransferRole.Receiver) {
+                        val completed = (total - phase.failed).coerceAtLeast(0)
+                        Text("${(completed.toLong() * 100 / total).coerceIn(0, 100)}% completed ($total requested, excluding known duplicates)")
+                    }
                     if (phase.skipped > 0) {
                         Text("${phase.skipped} tracks skipped (already in library)")
                     }

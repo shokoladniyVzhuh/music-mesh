@@ -19,6 +19,10 @@ import com.google.android.gms.nearby.connection.Strategy
 import com.mesh.app.data.model.Track
 import com.mesh.app.data.repository.TrackRepository
 import com.mesh.app.library.ImportItemResult
+import com.mesh.app.library.StoragePolicy
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -32,7 +36,7 @@ import java.io.File
 import java.io.FileOutputStream
 
 /**
- * Nearby discovery/connect plus Stage 3 catalog + file transfer.
+ * Nearby discovery/connect, catalog exchange and resilient file transfer.
  */
 class NearbyManager(
     context: Context,
@@ -47,28 +51,63 @@ class NearbyManager(
 
     private var localNickname: String = "Mesh"
     private var pendingPeerNickname: String? = null
+    private var pendingEndpointId: String? = null
     private var isAdvertising = false
     private var isDiscovering = false
+    private var wantsAdvertising = false
+    private var wantsDiscovery = false
+    private var advertisingStartInFlight = false
+    private var discoveryStartInFlight = false
+    private val intentionallyClosingEndpoints = mutableSetOf<String>()
 
     /** Sender: tracks still to send. */
     private var sendQueue: List<Track> = emptyList()
     private var sendIndex: Int = 0
     private var activeOutgoingPayloadId: Long? = null
+    private var activeOutgoingPayload: Payload? = null
+    private val failedOutgoingTrackIds = mutableSetOf<String>()
+    private var publishedTrackIds: Set<String> = emptySet()
+    private var incomingLedger = IncomingTransferLedger(emptyList())
+    private val failedIncomingPayloadIds = mutableSetOf<Long>()
+    private val seenIncomingPayloadIds = mutableSetOf<Long>()
+    private val controlPayloadIds = mutableSetOf<Long>()
+    private var watchdog: Job? = null
 
     /** Receiver: payloadId → remote track metadata. */
     private val pendingOffers = mutableMapOf<Long, RemoteTrack>()
     private val receivedFilePayloads = mutableMapOf<Long, Payload>()
     /** Receiver: FILE payloads that reached SUCCESS before FILE_OFFER arrived. */
     private val completedIncomingPayloadIds = mutableSetOf<Long>()
+    private var inflightImports: Int = 0
+    private var transferFinishedReceived: Boolean = false
+    private var receiverInterruptedReason: String? = null
+    private var sessionToken: Long = 0
 
     fun setLocalNickname(nickname: String) {
         localNickname = nickname.ifBlank { "Mesh" }
     }
 
     fun startAdvertising() {
-        if (isAdvertising) return
         stopDiscovery()
+        if (isAdvertising) {
+            wantsAdvertising = true
+            return
+        }
+        if (advertisingStartInFlight) {
+            wantsAdvertising = true
+            _state.update {
+                it.copy(
+                    phase = TransferPhase.Advertising,
+                    role = null,
+                    errorMessage = null,
+                    incomingConnection = null,
+                )
+            }
+            return
+        }
         resetSessionKeepingIdle()
+        wantsAdvertising = true
+        advertisingStartInFlight = true
         _state.update {
             it.copy(
                 phase = TransferPhase.Advertising,
@@ -83,21 +122,30 @@ class NearbyManager(
         connectionsClient
             .startAdvertising(localNickname, SERVICE_ID, connectionLifecycleCallback, options)
             .addOnSuccessListener {
+                advertisingStartInFlight = false
+                if (!wantsAdvertising) {
+                    connectionsClient.stopAdvertising()
+                    return@addOnSuccessListener
+                }
                 isAdvertising = true
                 Log.d(TAG, "Advertising as $localNickname")
             }
             .addOnFailureListener { e ->
+                advertisingStartInFlight = false
                 isAdvertising = false
+                if (!wantsAdvertising) return@addOnFailureListener
+                wantsAdvertising = false
                 Log.e(TAG, "Advertising failed", e)
                 fail(e.message ?: "Advertising failed")
             }
     }
 
     fun stopAdvertising() {
-        if (!isAdvertising) return
+        val wasActive = isAdvertising || advertisingStartInFlight || wantsAdvertising
+        wantsAdvertising = false
         connectionsClient.stopAdvertising()
         isAdvertising = false
-        Log.d(TAG, "Stopped advertising")
+        if (wasActive) Log.d(TAG, "Stopped advertising")
         val phase = _state.value.phase
         if (phase is TransferPhase.Advertising || phase is TransferPhase.AwaitingAccept) {
             _state.update {
@@ -110,10 +158,31 @@ class NearbyManager(
     }
 
     fun startDiscovery() {
-        if (isDiscovering) return
         stopAdvertising()
+        if (isDiscovering) {
+            wantsDiscovery = true
+            return
+        }
+        if (discoveryStartInFlight) {
+            wantsDiscovery = true
+            _state.update {
+                it.copy(
+                    phase = TransferPhase.Discovering,
+                    role = null,
+                    discoveredPeers = emptyList(),
+                    errorMessage = null,
+                    incomingConnection = null,
+                    connectedEndpointId = null,
+                    remoteCatalog = emptyList(),
+                    selectedTrackIds = emptySet(),
+                )
+            }
+            return
+        }
         disconnectQuietly()
         clearTransferInternals()
+        wantsDiscovery = true
+        discoveryStartInFlight = true
         _state.update {
             it.copy(
                 phase = TransferPhase.Discovering,
@@ -132,21 +201,30 @@ class NearbyManager(
         connectionsClient
             .startDiscovery(SERVICE_ID, endpointDiscoveryCallback, options)
             .addOnSuccessListener {
+                discoveryStartInFlight = false
+                if (!wantsDiscovery) {
+                    connectionsClient.stopDiscovery()
+                    return@addOnSuccessListener
+                }
                 isDiscovering = true
                 Log.d(TAG, "Discovery started")
             }
             .addOnFailureListener { e ->
+                discoveryStartInFlight = false
                 isDiscovering = false
+                if (!wantsDiscovery) return@addOnFailureListener
+                wantsDiscovery = false
                 Log.e(TAG, "Discovery failed", e)
                 fail(e.message ?: "Discovery failed")
             }
     }
 
     fun stopDiscovery(clearPeers: Boolean = true) {
-        if (!isDiscovering) return
+        val wasActive = isDiscovering || discoveryStartInFlight || wantsDiscovery
+        wantsDiscovery = false
         connectionsClient.stopDiscovery()
         isDiscovering = false
-        Log.d(TAG, "Stopped discovery")
+        if (wasActive) Log.d(TAG, "Stopped discovery")
         if (_state.value.phase is TransferPhase.Discovering) {
             _state.update {
                 it.copy(
@@ -158,9 +236,12 @@ class NearbyManager(
     }
 
     fun requestConnection(endpointId: String) {
-        val peer = _state.value.discoveredPeers.find { it.endpointId == endpointId }
-        val peerName = peer?.nickname ?: "peer"
+        if (_state.value.phase !is TransferPhase.Discovering) return
+        val peer = _state.value.discoveredPeers.find { it.endpointId == endpointId } ?: return
+        val peerName = peer.nickname
         pendingPeerNickname = peerName
+        intentionallyClosingEndpoints.remove(endpointId)
+        pendingEndpointId = endpointId
         _state.update {
             it.copy(
                 phase = TransferPhase.Connecting,
@@ -170,22 +251,31 @@ class NearbyManager(
             )
         }
         stopDiscovery(clearPeers = false)
+        armWatchdog("Connection timed out. Try connecting again.")
+        val token = sessionToken
         connectionsClient
             .requestConnection(localNickname, endpointId, connectionLifecycleCallback)
             .addOnSuccessListener {
                 Log.d(TAG, "Connection request sent to $peerName ($endpointId)")
             }
             .addOnFailureListener { e ->
+                if (token != sessionToken || pendingEndpointId != endpointId) return@addOnFailureListener
                 Log.e(TAG, "requestConnection failed", e)
                 pendingPeerNickname = null
+                pendingEndpointId = null
                 fail(e.message ?: "Connection request failed")
+                closeTransport()
             }
     }
 
     fun acceptConnection(endpointId: String) {
+        if (pendingEndpointId != endpointId || _state.value.phase !is TransferPhase.AwaitingAccept) return
+        val token = sessionToken
+        armWatchdog("Connection timed out. Try connecting again.")
         connectionsClient
             .acceptConnection(endpointId, payloadCallback)
             .addOnSuccessListener {
+                if (token != sessionToken || endpointId in intentionallyClosingEndpoints) return@addOnSuccessListener
                 Log.d(TAG, "Accepted connection $endpointId")
                 _state.update {
                     it.copy(
@@ -195,14 +285,19 @@ class NearbyManager(
                 }
             }
             .addOnFailureListener { e ->
+                if (token != sessionToken || endpointId in intentionallyClosingEndpoints) return@addOnFailureListener
                 Log.e(TAG, "acceptConnection failed", e)
                 fail(e.message ?: "Accept failed", clearIncoming = true)
+                closeTransport()
             }
     }
 
     fun rejectConnection(endpointId: String) {
+        val token = sessionToken
         connectionsClient.rejectConnection(endpointId)
             .addOnCompleteListener {
+                if (token != sessionToken || pendingEndpointId != endpointId) return@addOnCompleteListener
+                if (pendingEndpointId == endpointId) pendingEndpointId = null
                 _state.update {
                     it.copy(
                         incomingConnection = null,
@@ -229,9 +324,16 @@ class NearbyManager(
         val endpointId = current.connectedEndpointId ?: return
         val selected = current.selectedTrackIds
         if (selected.isEmpty()) return
-
+        val token = sessionToken
+        // Claim the action before the first Room suspension so double-taps cannot launch two batches.
+        _state.update {
+            it.copy(phase = TransferPhase.Transferring(0, selected.size, null, 0))
+        }
+        armWatchdog("Could not prepare the download. Try again.")
         scope.launch {
+          try {
             val existing = trackRepository.existingHashes()
+            if (!isActiveSession(endpointId, token)) return@launch
             val toRequest = mutableListOf<String>()
             var skipped = 0
             for (track in current.remoteCatalog) {
@@ -242,6 +344,16 @@ class NearbyManager(
                     toRequest += track.id
                 }
             }
+
+            val sizes = current.remoteCatalog.filter { it.id in toRequest }.map { it.fileSize }
+            // Nearby download + cache copy + final sandbox copy may coexist temporarily.
+            if (sizes.isNotEmpty()) {
+                withContext(Dispatchers.IO) {
+                    StoragePolicy.ensureSpace(appContext.filesDir.usableSpace, sizes, copies = 3)
+                }
+            }
+            if (!isActiveSession(endpointId, token)) return@launch
+            incomingLedger = IncomingTransferLedger(toRequest)
 
             _state.update {
                 it.copy(
@@ -254,19 +366,6 @@ class NearbyManager(
                 )
             }
 
-            if (toRequest.isEmpty()) {
-                _state.update {
-                    it.copy(
-                        phase = TransferPhase.Success(
-                            transferred = 0,
-                            skipped = skipped,
-                        ),
-                    )
-                }
-                sendControl(endpointId, ControlMessage.Disconnect("Nothing to download"))
-                return@launch
-            }
-
             _state.update {
                 it.copy(
                     phase = TransferPhase.Transferring(
@@ -277,21 +376,44 @@ class NearbyManager(
                     ),
                 )
             }
-            sendControl(endpointId, ControlMessage.DownloadRequest(toRequest))
+            armWatchdog("Transfer stalled. The completed tracks are still in your library.")
+            sendControl(endpointId, ControlMessage.DownloadRequest(toRequest, skipped))
+          } catch (e: CancellationException) {
+            throw e
+          } catch (e: Exception) {
+            if (isActiveSession(endpointId, token)) {
+                fail(e.message ?: "Could not start download")
+                closeTransport()
+            }
+          }
         }
     }
 
+    /** End a transfer while keeping its result visible; fully received imports are allowed to finish. */
+    fun cancelTransfer(reason: String = "Connection closed by you") {
+        _state.value.connectedEndpointId?.let { sendControl(it, ControlMessage.Disconnect(reason), critical = false) }
+        handleConnectionClosed(reason)
+        closeTransport()
+    }
+
     fun disconnect(reason: String = "Closed by user") {
-        val endpointId = _state.value.connectedEndpointId
-        if (endpointId != null) {
-            runCatching {
-                sendControl(endpointId, ControlMessage.Disconnect(reason))
+        val endpointIds = setOfNotNull(
+            _state.value.connectedEndpointId,
+            pendingEndpointId,
+            _state.value.incomingConnection?.endpointId,
+        )
+        endpointIds.forEach { endpointId ->
+            intentionallyClosingEndpoints.add(endpointId)
+            if (endpointId == _state.value.connectedEndpointId) {
+                runCatching {
+                    sendControl(endpointId, ControlMessage.Disconnect(reason), critical = false)
+                }
             }
             connectionsClient.disconnectFromEndpoint(endpointId)
         }
+        stopAdvertising()
+        stopDiscovery()
         connectionsClient.stopAllEndpoints()
-        isAdvertising = false
-        isDiscovering = false
         clearTransferInternals()
         _state.value = TransferSessionState()
         Log.d(TAG, "Disconnected: $reason")
@@ -306,15 +428,20 @@ class NearbyManager(
             is TransferPhase.WaitingForCatalog,
             is TransferPhase.ChoosingTracks,
             is TransferPhase.WaitingForDownloadRequest,
+            is TransferPhase.WaitingForResult,
             is TransferPhase.Transferring,
             is TransferPhase.Success,
             is TransferPhase.PartialSuccess,
             -> {
                 // Keep connection for transfer UI routes.
             }
+            // Connecting / AwaitingAccept: only cancel on explicit back, not on forward nav.
+            // Forward nav happens after Connected; if dispose races here, keep waiting.
             is TransferPhase.Connecting,
             is TransferPhase.AwaitingAccept,
-            -> disconnect("Cancelled")
+            -> {
+                // no-op: do not disconnect mid-handshake
+            }
             else -> {
                 stopAdvertising()
                 stopDiscovery()
@@ -335,20 +462,21 @@ class NearbyManager(
     }
 
     fun resetAfterFinished() {
+        _state.value.connectedEndpointId?.let { intentionallyClosingEndpoints.add(it) }
+        stopAdvertising()
+        stopDiscovery()
         clearTransferInternals()
         connectionsClient.stopAllEndpoints()
-        isAdvertising = false
-        isDiscovering = false
         _state.value = TransferSessionState()
     }
 
     private fun onConnected(endpointId: String, peerName: String, role: TransferRole) {
+        watchdog?.cancel()
         pendingPeerNickname = null
+        pendingEndpointId = null
         stopDiscovery(clearPeers = true)
-        if (isAdvertising) {
-            connectionsClient.stopAdvertising()
-            isAdvertising = false
-        }
+        intentionallyClosingEndpoints.remove(endpointId)
+        stopAdvertising()
         Log.d(TAG, "Connected to $peerName ($endpointId) as $role")
         _state.update {
             it.copy(
@@ -372,11 +500,21 @@ class NearbyManager(
             scope.launch { publishCatalog(endpointId) }
         } else {
             _state.update { it.copy(phase = TransferPhase.WaitingForCatalog) }
+            armWatchdog("The sender did not send a catalog. Try connecting again.")
         }
     }
 
     private suspend fun publishCatalog(endpointId: String) {
-        val tracks = withContext(Dispatchers.IO) { trackRepository.getAllTracks() }
+        val token = sessionToken
+        val tracks = try {
+            withContext(Dispatchers.IO) { trackRepository.getAllTracks() }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (isActiveSession(endpointId, token)) cancelTransfer("Could not read the library")
+            return
+        }
+        if (!isActiveSession(endpointId, token)) return
         val remote = tracks.map {
             RemoteTrack(
                 id = it.id,
@@ -387,16 +525,23 @@ class NearbyManager(
                 fileHash = it.fileHash,
             )
         }
-        sendControl(endpointId, ControlMessage.TrackList(remote))
         _state.update {
             it.copy(phase = TransferPhase.WaitingForDownloadRequest)
         }
+        publishedTrackIds = remote.map { it.id }.toSet()
+        sendControl(endpointId, ControlMessage.TrackList(remote))
     }
 
     private fun handleControlMessage(endpointId: String, message: ControlMessage) {
+        if (_state.value.connectedEndpointId != endpointId) return
+        if (_state.value.isTerminal && message !is ControlMessage.Disconnect) return
         when (message) {
             is ControlMessage.TrackList -> {
                 if (_state.value.role != TransferRole.Receiver) return
+                if (_state.value.phase !is TransferPhase.WaitingForCatalog) return
+                require(message.tracks.map { it.id }.distinct().size == message.tracks.size) { "Repeated catalog IDs" }
+                require(message.tracks.all { it.fileSize > 0 && it.fileHash.isNotBlank() }) { "Invalid track catalog" }
+                watchdog?.cancel()
                 _state.update {
                     it.copy(
                         remoteCatalog = message.tracks,
@@ -407,11 +552,34 @@ class NearbyManager(
             }
             is ControlMessage.DownloadRequest -> {
                 if (_state.value.role != TransferRole.Sender) return
+                if (_state.value.phase !is TransferPhase.WaitingForDownloadRequest) return
+                require(message.trackIds.all { it in publishedTrackIds } &&
+                    message.trackIds.size.toLong() + message.skipped <= publishedTrackIds.size) {
+                    "Download request does not match the catalog"
+                }
+                _state.update {
+                    it.copy(
+                        skippedCount = message.skipped,
+                        totalRequested = message.trackIds.size,
+                        phase = TransferPhase.Transferring(0, message.trackIds.size, null, 0),
+                    )
+                }
+                armWatchdog("Transfer stalled. Try connecting again.")
                 scope.launch { startSending(endpointId, message.trackIds) }
             }
             is ControlMessage.FileOffer -> {
                 if (_state.value.role != TransferRole.Receiver) return
+                if (_state.value.phase !is TransferPhase.Transferring) return
+                require(_state.value.remoteCatalog.any {
+                    it.id in _state.value.selectedTrackIds && it == message.track
+                }) { "File does not match the requested catalog" }
+                if (!incomingLedger.offer(message.payloadId, message.track.id)) return
                 pendingOffers[message.payloadId] = message.track
+                if (failedIncomingPayloadIds.remove(message.payloadId)) {
+                    pendingOffers.remove(message.payloadId)
+                    recordIncomingFailure(message.track.id)
+                    return
+                }
                 _state.update {
                     val total = it.totalRequested.coerceAtLeast(1)
                     it.copy(
@@ -432,116 +600,96 @@ class NearbyManager(
             }
             is ControlMessage.TransferFinished -> {
                 if (_state.value.role != TransferRole.Receiver) return
-                finishReceiverSession()
+                if (_state.value.phase !is TransferPhase.Transferring) return
+                val failed = incomingLedger.recordSenderFailures(message.failedTrackIds)
+                _state.update { it.copy(failedCount = it.failedCount + failed, processedCount = it.processedCount + failed) }
+                transferFinishedReceived = true
+                maybeFinishReceiver()
+            }
+            is ControlMessage.TransferResult -> {
+                if (_state.value.role != TransferRole.Sender || _state.value.phase !is TransferPhase.WaitingForResult) return
+                TransferFinishLogic.validateReceiverResult(message, _state.value.totalRequested, _state.value.skippedCount)
+                watchdog?.cancel()
+                val resultPhase = if (message.failed == 0) {
+                    TransferPhase.Success(message.transferred, message.skipped)
+                } else {
+                    TransferPhase.PartialSuccess(message.transferred, message.skipped, message.failed,
+                        message.message ?: "Some tracks could not be saved by the receiver")
+                }
+                _state.update { it.copy(phase = resultPhase, transferredCount = message.transferred,
+                    skippedCount = message.skipped, failedCount = message.failed, currentTrackTitle = null) }
             }
             is ControlMessage.Disconnect -> {
-                val current = _state.value
-                if (current.phase is TransferPhase.Transferring ||
-                    current.phase is TransferPhase.ChoosingTracks ||
-                    current.phase is TransferPhase.WaitingForDownloadRequest ||
-                    current.phase is TransferPhase.WaitingForCatalog
-                ) {
-                    val transferred = current.transferredCount
-                    val total = current.totalRequested
-                    if (transferred > 0 && transferred < total) {
-                        _state.update {
-                            it.copy(
-                                phase = TransferPhase.PartialSuccess(
-                                    transferred = transferred,
-                                    skipped = it.skippedCount,
-                                    failed = it.failedCount,
-                                    message = message.reason,
-                                ),
-                                errorMessage = message.reason,
-                            )
-                        }
-                    } else if (transferred > 0 || current.skippedCount > 0) {
-                        _state.update {
-                            it.copy(
-                                phase = TransferPhase.Success(
-                                    transferred = transferred,
-                                    skipped = it.skippedCount,
-                                ),
-                            )
-                        }
-                    } else {
-                        fail(message.reason)
-                    }
-                } else {
-                    fail(message.reason)
-                }
-                connectionsClient.stopAllEndpoints()
-                isAdvertising = false
-                isDiscovering = false
-                clearTransferInternals()
+                handleConnectionClosed(message.reason)
+                closeTransport()
             }
         }
     }
 
     private suspend fun startSending(endpointId: String, trackIds: List<String>) {
-        val tracks = withContext(Dispatchers.IO) {
-            trackIds.mapNotNull { trackRepository.getById(it) }
+        val token = sessionToken
+        val tracks = try {
+            withContext(Dispatchers.IO) { trackIds.mapNotNull { trackRepository.getById(it) } }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (isActiveSession(endpointId, token)) cancelTransfer("Could not read the requested tracks")
+            return
         }
+        if (!isActiveSession(endpointId, token)) return
+        failedOutgoingTrackIds.addAll(trackIds - tracks.map { it.id }.toSet())
         sendQueue = tracks
         sendIndex = 0
         activeOutgoingPayloadId = null
         _state.update {
             it.copy(
-                totalRequested = tracks.size,
+                totalRequested = trackIds.size,
                 transferredCount = 0,
-                failedCount = 0,
+                failedCount = failedOutgoingTrackIds.size,
                 processedCount = 0,
                 phase = TransferPhase.Transferring(
                     completed = 0,
-                    total = tracks.size,
+                    total = trackIds.size,
                     currentTrackTitle = tracks.firstOrNull()?.title,
                     currentFilePercent = 0,
                 ),
             )
         }
-        if (tracks.isEmpty()) {
-            sendControl(endpointId, ControlMessage.TransferFinished)
-            _state.update {
-                it.copy(phase = TransferPhase.Success(transferred = 0, skipped = it.skippedCount))
-            }
-            return
-        }
         sendNextFile(endpointId)
     }
 
     private fun sendNextFile(endpointId: String) {
+        if (!isActiveSession(endpointId, sessionToken)) return
         if (sendIndex >= sendQueue.size) {
-            sendControl(endpointId, ControlMessage.TransferFinished)
-            val s = _state.value
-            val phase = if (s.failedCount > 0) {
-                TransferPhase.PartialSuccess(
-                    transferred = s.transferredCount,
-                    skipped = s.skippedCount,
-                    failed = s.failedCount,
-                    message = "Some tracks failed to send",
-                )
-            } else {
-                TransferPhase.Success(
-                    transferred = s.transferredCount,
-                    skipped = s.skippedCount,
-                )
-            }
-            _state.update { it.copy(phase = phase, currentTrackTitle = null, currentFilePercent = 0) }
+            _state.update { it.copy(phase = TransferPhase.WaitingForResult, currentTrackTitle = null, currentFilePercent = 0) }
+            armWatchdog("The receiver did not confirm saving the tracks. Check their library before retrying.")
+            sendControl(endpointId, ControlMessage.TransferFinished(failedOutgoingTrackIds.toList()))
             return
         }
 
         val track = sendQueue[sendIndex]
         val file = File(track.localPath)
-        if (!file.exists()) {
+        if (!file.isFile || file.length() != track.fileSize) {
             Log.e(TAG, "Missing file for ${track.id}")
             _state.update { it.copy(failedCount = it.failedCount + 1) }
+            failedOutgoingTrackIds.add(track.id)
             sendIndex++
             sendNextFile(endpointId)
             return
         }
 
-        val filePayload = Payload.fromFile(file)
+        val filePayload = try {
+            Payload.fromFile(file)
+        } catch (e: Exception) {
+            Log.e(TAG, "Payload.fromFile failed for ${track.id}", e)
+            _state.update { it.copy(failedCount = it.failedCount + 1) }
+            failedOutgoingTrackIds.add(track.id)
+            sendIndex++
+            sendNextFile(endpointId)
+            return
+        }
         activeOutgoingPayloadId = filePayload.id
+        activeOutgoingPayload = filePayload
         val remote = RemoteTrack(
             id = track.id,
             title = track.title,
@@ -550,7 +698,6 @@ class NearbyManager(
             fileSize = track.fileSize,
             fileHash = track.fileHash,
         )
-        sendControl(endpointId, ControlMessage.FileOffer(remote, filePayload.id))
         _state.update {
             it.copy(
                 currentTrackTitle = track.title,
@@ -563,19 +710,41 @@ class NearbyManager(
                 ),
             )
         }
+        // sendPayload task success only schedules a send; receiver handles either arrival order.
+        val offerBytes = TransferProtocol.encode(ControlMessage.FileOffer(remote, filePayload.id))
+        if (offerBytes.size > MAX_CONTROL_BYTES) {
+            cancelTransfer("Track metadata is too large to send.")
+            return
+        }
+        val offerPayload = Payload.fromBytes(offerBytes)
+        controlPayloadIds.add(offerPayload.id)
+        val token = sessionToken
         connectionsClient
-            .sendPayload(endpointId, filePayload)
+            .sendPayload(endpointId, offerPayload)
+            .addOnSuccessListener {
+                if (!isActiveSession(endpointId, token) || activeOutgoingPayloadId != filePayload.id) {
+                    filePayload.close()
+                    return@addOnSuccessListener
+                }
+                connectionsClient
+                    .sendPayload(endpointId, filePayload)
+                    .addOnFailureListener { e ->
+                        if (!isActiveSession(endpointId, token)) return@addOnFailureListener
+                        Log.e(TAG, "sendPayload(file) failed", e)
+                        onOutgoingFileFailed(endpointId, filePayload.id)
+                    }
+            }
             .addOnFailureListener { e ->
-                Log.e(TAG, "sendPayload failed", e)
-                _state.update { it.copy(failedCount = it.failedCount + 1) }
-                sendIndex++
-                activeOutgoingPayloadId = null
-                sendNextFile(endpointId)
+                if (!isActiveSession(endpointId, token)) return@addOnFailureListener
+                Log.e(TAG, "sendPayload(FILE_OFFER) failed", e)
+                cancelTransfer("Could not send file information. Try connecting again.")
             }
     }
 
     private fun onOutgoingFileComplete(endpointId: String, payloadId: Long) {
         if (payloadId != activeOutgoingPayloadId) return
+        activeOutgoingPayload?.close()
+        activeOutgoingPayload = null
         activeOutgoingPayloadId = null
         _state.update {
             val completed = it.transferredCount + 1
@@ -594,6 +763,17 @@ class NearbyManager(
         sendNextFile(endpointId)
     }
 
+    private fun onOutgoingFileFailed(endpointId: String, payloadId: Long) {
+        if (payloadId != activeOutgoingPayloadId) return
+        activeOutgoingPayloadId = null
+        activeOutgoingPayload?.close()
+        activeOutgoingPayload = null
+        failedOutgoingTrackIds.add(sendQueue[sendIndex].id)
+        _state.update { it.copy(failedCount = it.failedCount + 1) }
+        sendIndex++
+        sendNextFile(endpointId)
+    }
+
     private fun onIncomingFileComplete(endpointId: String, payloadId: Long, payload: Payload) {
         val remote = pendingOffers.remove(payloadId) ?: run {
             // Offer not yet received — keep payload until FILE_OFFER arrives.
@@ -604,145 +784,267 @@ class NearbyManager(
         }
         completedIncomingPayloadIds.remove(payloadId)
         receivedFilePayloads.remove(payloadId)
+        if (!incomingLedger.recordProcessed(remote.id)) {
+            cleanupPayloadFile(payload)
+            return
+        }
+        inflightImports++
+        val importSessionToken = sessionToken
         scope.launch {
-            val tempFile = withContext(Dispatchers.IO) {
-                materializePayloadFile(payload, remote.id)
-            }
-            if (tempFile == null) {
-                cleanupPayloadFile(payload)
-                _state.update {
-                    val failed = it.failedCount + 1
-                    val processed = it.processedCount + 1
-                    it.copy(
-                        failedCount = failed,
-                        processedCount = processed,
-                        phase = TransferPhase.Transferring(
-                            completed = processed,
-                            total = it.totalRequested,
-                            currentTrackTitle = remote.title,
-                            currentFilePercent = 0,
-                        ),
-                    )
+            var tempFile: File? = null
+            try {
+                tempFile = withContext(Dispatchers.IO) {
+                    materializePayloadFile(payload, remote)
                 }
-                return@launch
-            }
-            when (val result = trackRepository.importP2pTrack(tempFile, remote)) {
-                is ImportItemResult.Success -> {
-                    _state.update {
-                        val transferred = it.transferredCount + 1
-                        val processed = it.processedCount + 1
-                        it.copy(
-                            transferredCount = transferred,
-                            processedCount = processed,
-                            currentFilePercent = 100,
-                            phase = TransferPhase.Transferring(
-                                completed = processed,
-                                total = it.totalRequested,
-                                currentTrackTitle = remote.title,
-                                currentFilePercent = 100,
-                            ),
-                        )
-                    }
-                }
-                is ImportItemResult.SkippedDuplicate -> {
-                    _state.update {
-                        val skipped = it.skippedCount + 1
-                        val processed = it.processedCount + 1
-                        it.copy(
-                            skippedCount = skipped,
-                            processedCount = processed,
-                            phase = TransferPhase.Transferring(
-                                completed = processed,
-                                total = it.totalRequested,
-                                currentTrackTitle = remote.title,
-                                currentFilePercent = 100,
-                            ),
-                        )
-                    }
-                }
-                is ImportItemResult.Failed -> {
-                    Log.e(TAG, "Import failed: ${result.failure.reason}")
+                if (tempFile == null) {
+                    cleanupPayloadFile(payload)
+                    if (importSessionToken != sessionToken) return@launch
+                    Log.e(TAG, "Could not materialize incoming file for ${remote.title}")
                     _state.update {
                         val failed = it.failedCount + 1
                         val processed = it.processedCount + 1
                         it.copy(
                             failedCount = failed,
                             processedCount = processed,
-                            phase = TransferPhase.Transferring(
-                                completed = processed,
-                                total = it.totalRequested,
-                                currentTrackTitle = remote.title,
-                                currentFilePercent = 0,
-                            ),
+                            errorMessage = "Could not read the received file",
+                            phase = (it.phase as? TransferPhase.Transferring)?.copy(completed = processed) ?: it.phase,
                         )
                     }
+                    return@launch
+                }
+                val result = trackRepository.importP2pTrack(tempFile, remote)
+                if (importSessionToken != sessionToken) {
+                    tempFile.delete()
+                    cleanupPayloadFile(payload)
+                    return@launch
+                }
+                when (result) {
+                    is ImportItemResult.Success -> {
+                        Log.d(TAG, "Imported P2P track ${result.track.id}")
+                        _state.update {
+                            val transferred = it.transferredCount + 1
+                            val processed = it.processedCount + 1
+                            it.copy(
+                                transferredCount = transferred,
+                                processedCount = processed,
+                                phase = (it.phase as? TransferPhase.Transferring)?.copy(completed = processed) ?: it.phase,
+                            )
+                        }
+                    }
+                    is ImportItemResult.SkippedDuplicate -> {
+                        _state.update {
+                            val skipped = it.skippedCount + 1
+                            val processed = it.processedCount + 1
+                            it.copy(
+                                skippedCount = skipped,
+                                processedCount = processed,
+                                phase = (it.phase as? TransferPhase.Transferring)?.copy(completed = processed) ?: it.phase,
+                            )
+                        }
+                    }
+                    is ImportItemResult.Failed -> {
+                        Log.e(TAG, "Import failed: ${result.failure.reason}")
+                        _state.update {
+                            val failed = it.failedCount + 1
+                            val processed = it.processedCount + 1
+                            it.copy(
+                                failedCount = failed,
+                                processedCount = processed,
+                                errorMessage = result.failure.reason,
+                                phase = (it.phase as? TransferPhase.Transferring)?.copy(completed = processed) ?: it.phase,
+                            )
+                        }
+                    }
+                }
+                tempFile.delete()
+                cleanupPayloadFile(payload)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Incoming import failed", e)
+                if (importSessionToken == sessionToken) {
+                    _state.update { it.copy(failedCount = it.failedCount + 1,
+                        processedCount = it.processedCount + 1, errorMessage = e.message ?: "Could not save track") }
+                }
+            } finally {
+                tempFile?.delete()
+                cleanupPayloadFile(payload)
+                if (importSessionToken == sessionToken) {
+                    inflightImports = (inflightImports - 1).coerceAtLeast(0)
+                    maybeFinishReceiver()
                 }
             }
-            tempFile.delete()
-            cleanupPayloadFile(payload)
         }
     }
 
-    private fun finishReceiverSession() {
+    private fun maybeFinishReceiver() {
+        if (inflightImports > 0) return
+        val interruptedReason = receiverInterruptedReason
+        if (interruptedReason != null) {
+            finishReceiverSession(interruptedReason)
+            return
+        }
+        if (!transferFinishedReceived) return
+        if (!TransferFinishLogic.receiverCanFinishNormally(
+                processed = _state.value.processedCount,
+                totalRequested = _state.value.totalRequested,
+                inflightImports = inflightImports,
+            )
+        ) {
+            return
+        }
+        transferFinishedReceived = false
+        finishReceiverSession()
+    }
+
+    private fun finishReceiverSession(interruptedReason: String? = null) {
         val s = _state.value
-        val phase = TransferFinishLogic.receiverPhase(
+        val calculated = TransferFinishLogic.receiverPhase(
             transferred = s.transferredCount,
             skipped = s.skippedCount,
             failed = s.failedCount,
             processed = s.processedCount,
             totalRequested = s.totalRequested,
         )
+        val phase = if (calculated is TransferPhase.PartialSuccess) {
+            calculated.copy(message = interruptedReason ?: s.errorMessage ?: calculated.message)
+        } else {
+            calculated
+        }
         _state.update {
             it.copy(
                 phase = phase,
                 currentTrackTitle = null,
                 currentFilePercent = 0,
+                errorMessage = interruptedReason ?: s.errorMessage,
             )
         }
+        watchdog?.cancel()
+        s.connectedEndpointId?.let { endpointId ->
+            val failed = (phase as? TransferPhase.PartialSuccess)?.failed ?: 0
+            sendControl(endpointId, ControlMessage.TransferResult(s.transferredCount, s.skippedCount,
+                failed, interruptedReason ?: s.errorMessage), critical = false)
+        }
+        receiverInterruptedReason = null
+        transferFinishedReceived = false
+        discardPendingIncomingFiles()
     }
 
-    private fun materializePayloadFile(payload: Payload, trackId: String): File? {
+    private fun materializePayloadFile(payload: Payload, remote: RemoteTrack): File? {
         val payloadFile = payload.asFile() ?: return null
         val cacheDir = File(appContext.cacheDir, "nearby_incoming").apply { mkdirs() }
-        val out = File(cacheDir, "$trackId-${payload.id}.mp3")
+        // Never use a remote ID as a filesystem path.
+        val out = File(cacheDir, "${payload.id}.mp3")
         return try {
-            val javaFile = payloadFile.asJavaFile()
-            if (javaFile != null) {
-                javaFile.inputStream().use { input ->
-                    FileOutputStream(out).use { output -> input.copyTo(output) }
+            StoragePolicy.ensureSpace(cacheDir.usableSpace, listOf(remote.fileSize), copies = 2)
+            val uri = payloadFile.asUri()
+            if (uri != null) {
+                appContext.contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(out).use { output ->
+                        StoragePolicy.copy(input, output, remote.fileSize, remote.fileSize)
+                    }
+                } ?: run {
+                    out.delete()
+                    return null
                 }
+                runCatching { appContext.contentResolver.delete(uri, null, null) }
             } else {
-                val pfd = payloadFile.asParcelFileDescriptor() ?: return null
-                pfd.use { descriptor ->
+                payloadFile.asParcelFileDescriptor().use { descriptor ->
                     java.io.FileInputStream(descriptor.fileDescriptor).use { input ->
-                        FileOutputStream(out).use { output -> input.copyTo(output) }
+                        FileOutputStream(out).use { output ->
+                            StoragePolicy.copy(input, output, remote.fileSize, remote.fileSize)
+                        }
                     }
                 }
             }
+            if (!out.exists() || out.length() <= 0L) {
+                Log.e(TAG, "Materialized file empty for payload ${payload.id}")
+                out.delete()
+                return null
+            }
+            Log.d(TAG, "Materialized ${out.length()} bytes for ${remote.id}")
             out
         } catch (e: Exception) {
             Log.e(TAG, "Failed to materialize payload", e)
             out.delete()
-            null
+            throw e
         }
     }
 
     private fun cleanupPayloadFile(payload: Payload) {
         runCatching {
-            payload.asFile()?.asJavaFile()?.delete()
+            payload.asFile()?.let { file ->
+                val uri = file.asUri()
+                if (uri != null) {
+                    appContext.contentResolver.delete(uri, null, null)
+                } else {
+                    @Suppress("DEPRECATION")
+                    file.asJavaFile()?.delete()
+                }
+            }
         }
+        runCatching { payload.close() }
     }
 
-    private fun sendControl(endpointId: String, message: ControlMessage) {
+    private fun sendControl(endpointId: String, message: ControlMessage, critical: Boolean = true) {
         val bytes = TransferProtocol.encode(message)
+        if (bytes.size > MAX_CONTROL_BYTES) {
+            if (critical) cancelTransfer("The catalog is too large to send in this version of Music Mesh.")
+            return
+        }
+        val token = sessionToken
+        val payload = Payload.fromBytes(bytes)
+        controlPayloadIds.add(payload.id)
         connectionsClient
-            .sendPayload(endpointId, Payload.fromBytes(bytes))
+            .sendPayload(endpointId, payload)
             .addOnFailureListener { e ->
+                if (token != sessionToken) return@addOnFailureListener
+                controlPayloadIds.remove(payload.id)
                 Log.e(TAG, "Failed to send ${message::class.simpleName}", e)
+                if (critical && isActiveSession(endpointId, token)) {
+                    cancelTransfer("Could not send transfer instructions. Try connecting again.")
+                }
             }
     }
 
+    private fun isActiveSession(endpointId: String, token: Long): Boolean =
+        token == sessionToken && _state.value.connectedEndpointId == endpointId && !_state.value.isTerminal
+
+    private fun armWatchdog(reason: String) {
+        watchdog?.cancel()
+        val token = sessionToken
+        watchdog = scope.launch {
+            delay(STALL_TIMEOUT_MS)
+            if (token == sessionToken && !_state.value.isTerminal) cancelTransfer(reason)
+        }
+    }
+
+    private fun recordIncomingFailure(trackId: String) {
+        if (!incomingLedger.recordProcessed(trackId)) return
+        _state.update { it.copy(failedCount = it.failedCount + 1, processedCount = it.processedCount + 1) }
+        maybeFinishReceiver()
+    }
+
+    /** Stop network work, but don't invalidate imports of FILE payloads already at SUCCESS. */
+    private fun closeTransport() {
+        watchdog?.cancel()
+        setOfNotNull(_state.value.connectedEndpointId, pendingEndpointId,
+            _state.value.incomingConnection?.endpointId).forEach { intentionallyClosingEndpoints.add(it) }
+        activeOutgoingPayloadId?.let { connectionsClient.cancelPayload(it) }
+        activeOutgoingPayload?.let { runCatching { it.close() } }
+        activeOutgoingPayload = null
+        activeOutgoingPayloadId = null
+        receivedFilePayloads.keys.filterNot { it in completedIncomingPayloadIds }
+            .forEach { connectionsClient.cancelPayload(it) }
+        stopAdvertising()
+        stopDiscovery()
+        connectionsClient.stopAllEndpoints()
+        pendingEndpointId = null
+        _state.update { it.copy(connectedEndpointId = null, incomingConnection = null) }
+    }
+
     private fun fail(message: String, clearIncoming: Boolean = false) {
+        watchdog?.cancel()
         _state.update {
             it.copy(
                 phase = TransferPhase.Failed(message),
@@ -753,8 +1055,13 @@ class NearbyManager(
     }
 
     private fun disconnectQuietly() {
-        val endpointId = _state.value.connectedEndpointId
-        if (endpointId != null) {
+        val endpointIds = setOfNotNull(
+            _state.value.connectedEndpointId,
+            pendingEndpointId,
+            _state.value.incomingConnection?.endpointId,
+        )
+        endpointIds.forEach { endpointId ->
+            intentionallyClosingEndpoints.add(endpointId)
             connectionsClient.disconnectFromEndpoint(endpointId)
         }
         connectionsClient.stopAllEndpoints()
@@ -767,16 +1074,76 @@ class NearbyManager(
     }
 
     private fun clearTransferInternals() {
+        sessionToken++
+        watchdog?.cancel()
+        watchdog = null
+        activeOutgoingPayloadId?.let { connectionsClient.cancelPayload(it) }
+        activeOutgoingPayload?.let { runCatching { it.close() } }
+        activeOutgoingPayload = null
+        failedOutgoingTrackIds.clear()
+        publishedTrackIds = emptySet()
+        incomingLedger = IncomingTransferLedger(emptyList())
+        failedIncomingPayloadIds.clear()
+        seenIncomingPayloadIds.clear()
+        controlPayloadIds.clear()
         sendQueue = emptyList()
         sendIndex = 0
         activeOutgoingPayloadId = null
+        pendingEndpointId = null
+        discardPendingIncomingFiles()
+        inflightImports = 0
+        transferFinishedReceived = false
+        receiverInterruptedReason = null
+    }
+
+    private fun discardPendingIncomingFiles() {
+        receivedFilePayloads.keys.filterNot { it in completedIncomingPayloadIds }
+            .forEach { connectionsClient.cancelPayload(it) }
+        receivedFilePayloads.values.toList().forEach(::cleanupPayloadFile)
         pendingOffers.clear()
         receivedFilePayloads.clear()
         completedIncomingPayloadIds.clear()
     }
 
+    private fun handleConnectionClosed(reason: String) {
+        val current = _state.value
+        if (current.phase is TransferPhase.Success ||
+            current.phase is TransferPhase.PartialSuccess ||
+            current.phase is TransferPhase.Failed
+        ) {
+            return
+        }
+
+        if (current.role == TransferRole.Receiver && current.totalRequested > 0) {
+            receiverInterruptedReason = reason
+            maybeFinishReceiver()
+            return
+        }
+
+        val processed = current.transferredCount + current.failedCount
+        if (processed > 0 || current.skippedCount > 0) {
+            val missing = (current.totalRequested - processed).coerceAtLeast(0)
+            _state.update {
+                it.copy(
+                    phase = TransferPhase.PartialSuccess(
+                        transferred = current.transferredCount,
+                        skipped = current.skippedCount,
+                        failed = current.failedCount + missing,
+                        message = reason,
+                    ),
+                    errorMessage = reason,
+                )
+            }
+            clearTransferInternals()
+        } else {
+            fail(reason)
+            clearTransferInternals()
+        }
+    }
+
     private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
+            if (!wantsDiscovery) return
             val nickname = info.endpointName.ifBlank { endpointId }
             Log.d(TAG, "Found $nickname ($endpointId)")
             _state.update { current ->
@@ -799,7 +1166,21 @@ class NearbyManager(
 
     private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
         override fun onConnectionInitiated(endpointId: String, connectionInfo: ConnectionInfo) {
+            if (endpointId in intentionallyClosingEndpoints) {
+                connectionsClient.rejectConnection(endpointId)
+                Log.d(TAG, "Rejected late initiation for cancelled endpoint $endpointId")
+                return
+            }
+            if (_state.value.connectedEndpointId != null ||
+                (connectionInfo.isIncomingConnection && (!wantsAdvertising ||
+                    (pendingEndpointId != null && pendingEndpointId != endpointId))) ||
+                (!connectionInfo.isIncomingConnection && pendingEndpointId != endpointId)
+            ) {
+                connectionsClient.rejectConnection(endpointId)
+                return
+            }
             val nickname = connectionInfo.endpointName.ifBlank { endpointId }
+            pendingEndpointId = endpointId
             Log.d(TAG, "Connection initiated from $nickname ($endpointId), incoming=${connectionInfo.isIncomingConnection}")
             if (connectionInfo.isIncomingConnection) {
                 _state.update {
@@ -811,6 +1192,7 @@ class NearbyManager(
                     )
                 }
             } else {
+                val token = sessionToken
                 _state.update {
                     it.copy(
                         phase = TransferPhase.Connecting,
@@ -821,13 +1203,30 @@ class NearbyManager(
                 connectionsClient
                     .acceptConnection(endpointId, payloadCallback)
                     .addOnFailureListener { e ->
+                        if (token != sessionToken || pendingEndpointId != endpointId || _state.value.isTerminal) return@addOnFailureListener
                         Log.e(TAG, "Sender acceptConnection failed", e)
                         fail(e.message ?: "Accept failed")
+                        closeTransport()
                     }
             }
         }
 
         override fun onConnectionResult(endpointId: String, resolution: ConnectionResolution) {
+            if (endpointId in intentionallyClosingEndpoints) {
+                if (resolution.status.statusCode == ConnectionsStatusCodes.STATUS_OK) {
+                    connectionsClient.disconnectFromEndpoint(endpointId)
+                } else {
+                    intentionallyClosingEndpoints.remove(endpointId)
+                }
+                Log.d(TAG, "Ignored late result for cancelled endpoint $endpointId")
+                return
+            }
+            if (pendingEndpointId != endpointId || _state.value.isTerminal) {
+                if (resolution.status.statusCode == ConnectionsStatusCodes.STATUS_OK &&
+                    _state.value.connectedEndpointId != endpointId) connectionsClient.disconnectFromEndpoint(endpointId)
+                return
+            }
+            watchdog?.cancel()
             when (resolution.status.statusCode) {
                 ConnectionsStatusCodes.STATUS_OK -> {
                     val role = _state.value.role
@@ -849,6 +1248,7 @@ class NearbyManager(
                 ConnectionsStatusCodes.STATUS_CONNECTION_REJECTED -> {
                     Log.d(TAG, "Connection rejected by $endpointId")
                     pendingPeerNickname = null
+                    pendingEndpointId = null
                     _state.update {
                         it.copy(
                             phase = if (isAdvertising) {
@@ -862,78 +1262,61 @@ class NearbyManager(
                         )
                     }
                     if (!isAdvertising) {
-                        startDiscovery()
+                        closeTransport()
                     }
                 }
                 ConnectionsStatusCodes.STATUS_ERROR -> {
                     pendingPeerNickname = null
+                    pendingEndpointId = null
                     fail("Connection error", clearIncoming = true)
+                    closeTransport()
                 }
                 else -> {
                     pendingPeerNickname = null
+                    pendingEndpointId = null
                     fail(
                         resolution.status.statusMessage ?: "Connection failed",
                         clearIncoming = true,
                     )
+                    closeTransport()
                 }
             }
         }
 
         override fun onDisconnected(endpointId: String) {
             Log.d(TAG, "Disconnected from $endpointId")
-            val current = _state.value
-            when (current.phase) {
-                is TransferPhase.Success,
-                is TransferPhase.PartialSuccess,
-                -> {
-                    // Already finished; leave result visible.
-                    clearTransferInternals()
-                }
-                is TransferPhase.Transferring -> {
-                    val transferred = current.transferredCount
-                    if (transferred > 0) {
-                        _state.update {
-                            TransferSessionState(
-                                phase = TransferPhase.PartialSuccess(
-                                    transferred = transferred,
-                                    skipped = current.skippedCount,
-                                    failed = current.failedCount,
-                                    message = "Connection closed, transfer interrupted",
-                                ),
-                                role = current.role,
-                                peerNickname = current.peerNickname,
-                                transferredCount = transferred,
-                                skippedCount = current.skippedCount,
-                                failedCount = current.failedCount,
-                                totalRequested = current.totalRequested,
-                                errorMessage = "Peer disconnected",
-                            )
-                        }
-                    } else {
-                        fail("Peer disconnected")
-                    }
-                    clearTransferInternals()
-                }
-                else -> {
-                    fail("Peer disconnected")
-                    clearTransferInternals()
-                }
+            if (intentionallyClosingEndpoints.remove(endpointId)) {
+                Log.d(TAG, "Ignoring expected disconnect callback for $endpointId")
+                return
             }
-            isAdvertising = false
-            isDiscovering = false
+            if (endpointId != _state.value.connectedEndpointId && endpointId != pendingEndpointId) return
+            handleConnectionClosed("Connection closed, transfer interrupted")
+            closeTransport()
         }
     }
 
     private val payloadCallback = object : PayloadCallback() {
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
+            if (_state.value.connectedEndpointId != endpointId || _state.value.isTerminal) {
+                if (payload.type == Payload.Type.FILE) cleanupPayloadFile(payload)
+                return
+            }
             when (payload.type) {
                 Payload.Type.BYTES -> {
                     val bytes = payload.asBytes() ?: return
-                    runCatching { TransferProtocol.decode(bytes) }
-                        .onSuccess { handleControlMessage(endpointId, it) }
-                        .onFailure { e -> Log.e(TAG, "Bad control payload", e) }
+                    runCatching { handleControlMessage(endpointId, TransferProtocol.decode(bytes)) }
+                        .onFailure { e ->
+                            Log.e(TAG, "Bad control payload", e)
+                            cancelTransfer(e.message ?: "Invalid transfer instructions")
+                        }
                 }
                 Payload.Type.FILE -> {
+                    if (_state.value.role != TransferRole.Receiver ||
+                        _state.value.phase !is TransferPhase.Transferring) {
+                        cleanupPayloadFile(payload)
+                        return
+                    }
+                    if (!seenIncomingPayloadIds.add(payload.id)) return
                     receivedFilePayloads[payload.id] = payload
                     Log.d(TAG, "File payload received id=${payload.id}")
                 }
@@ -942,6 +1325,17 @@ class NearbyManager(
         }
 
         override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {
+            if (!isActiveSession(endpointId, sessionToken)) return
+            if (update.payloadId in controlPayloadIds) {
+                when (update.status) {
+                    PayloadTransferUpdate.Status.SUCCESS -> controlPayloadIds.remove(update.payloadId)
+                    PayloadTransferUpdate.Status.FAILURE, PayloadTransferUpdate.Status.CANCELED -> {
+                        controlPayloadIds.remove(update.payloadId)
+                        cancelTransfer("Transfer instructions could not be delivered. Try connecting again.")
+                    }
+                }
+                return
+            }
             val percent = if (update.totalBytes > 0) {
                 ((update.bytesTransferred * 100) / update.totalBytes).toInt().coerceIn(0, 100)
             } else {
@@ -950,14 +1344,16 @@ class NearbyManager(
             when (update.status) {
                 PayloadTransferUpdate.Status.IN_PROGRESS -> {
                     if (_state.value.role == TransferRole.Receiver &&
-                        pendingOffers.containsKey(update.payloadId)
+                        (pendingOffers.containsKey(update.payloadId) ||
+                            receivedFilePayloads.containsKey(update.payloadId))
                     ) {
+                        armWatchdog("Transfer stalled. The completed tracks are still in your library.")
                         _state.update {
                             val total = it.totalRequested.coerceAtLeast(1)
                             it.copy(
                                 currentFilePercent = percent,
                                 phase = TransferPhase.Transferring(
-                                    completed = it.transferredCount,
+                                    completed = it.processedCount,
                                     total = total,
                                     currentTrackTitle = it.currentTrackTitle,
                                     currentFilePercent = percent,
@@ -967,6 +1363,7 @@ class NearbyManager(
                     } else if (_state.value.role == TransferRole.Sender &&
                         update.payloadId == activeOutgoingPayloadId
                     ) {
+                        armWatchdog("Transfer stalled. Check the receiver's library before retrying.")
                         _state.update {
                             it.copy(
                                 currentFilePercent = percent,
@@ -1005,22 +1402,16 @@ class NearbyManager(
                     if (_state.value.role == TransferRole.Sender &&
                         update.payloadId == activeOutgoingPayloadId
                     ) {
-                        activeOutgoingPayloadId = null
-                        _state.update { it.copy(failedCount = it.failedCount + 1) }
-                        sendIndex++
-                        sendNextFile(endpointId)
+                        onOutgoingFileFailed(endpointId, update.payloadId)
                     } else if (_state.value.role == TransferRole.Receiver) {
-                        pendingOffers.remove(update.payloadId)
+                        val offer = pendingOffers.remove(update.payloadId)
+                        val payload = receivedFilePayloads.remove(update.payloadId)
+                        // BYTES callbacks must never count as failed tracks.
+                        if (offer == null && payload == null) return
                         completedIncomingPayloadIds.remove(update.payloadId)
-                        receivedFilePayloads.remove(update.payloadId)?.let { cleanupPayloadFile(it) }
-                        _state.update {
-                            val failed = it.failedCount + 1
-                            val processed = it.processedCount + 1
-                            it.copy(
-                                failedCount = failed,
-                                processedCount = processed,
-                            )
-                        }
+                        payload?.let(::cleanupPayloadFile)
+                        if (offer != null) recordIncomingFailure(offer.id)
+                        else failedIncomingPayloadIds.add(update.payloadId)
                     }
                 }
             }
@@ -1029,6 +1420,9 @@ class NearbyManager(
 
     companion object {
         private const val TAG = "NearbyManager"
+        private const val STALL_TIMEOUT_MS = 120_000L
+        // Nearby Connections MAX_BYTES_DATA_SIZE; catalog chunking is a separate future feature.
+        private const val MAX_CONTROL_BYTES = 32_768
         const val SERVICE_ID = "com.mesh.app.nearby"
         private val STRATEGY = Strategy.P2P_POINT_TO_POINT
     }

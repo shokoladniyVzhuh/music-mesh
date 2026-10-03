@@ -2,6 +2,7 @@ package com.mesh.app.transfer
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class TransferProtocolTest {
@@ -52,13 +53,88 @@ class TransferProtocolTest {
     fun transferFinished_and_disconnect_roundTrip() {
         assertTrue(
             TransferProtocol.decode(
-                TransferProtocol.encode(ControlMessage.TransferFinished),
+                TransferProtocol.encode(ControlMessage.TransferFinished()),
             ) is ControlMessage.TransferFinished,
         )
         val disconnect = TransferProtocol.decode(
             TransferProtocol.encode(ControlMessage.Disconnect("peer left")),
         ) as ControlMessage.Disconnect
         assertEquals("peer left", disconnect.reason)
+    }
+
+    @Test
+    fun failedSenderTracks_roundTrip() {
+        val message = ControlMessage.TransferFinished(listOf("missing", "unreadable"))
+        assertEquals(message, TransferProtocol.decode(TransferProtocol.encode(message)))
+    }
+
+    @Test
+    fun duplicateOnlyRequest_roundTrip() {
+        val message = ControlMessage.DownloadRequest(emptyList(), skipped = 4)
+        assertEquals(message, TransferProtocol.decode(TransferProtocol.encode(message)))
+    }
+
+    @Test
+    fun receiverAcknowledgement_roundTrip_withFailureReason() {
+        val message = ControlMessage.TransferResult(2, 3, 1, "Hash mismatch")
+        assertEquals(message, TransferProtocol.decode(TransferProtocol.encode(message)))
+    }
+
+    @Test
+    fun receiverAcknowledgement_roundTrip_withoutFailure() {
+        val message = ControlMessage.TransferResult(3, 0, 0)
+        assertEquals(message, TransferProtocol.decode(TransferProtocol.encode(message)))
+    }
+
+    @Test
+    fun oldProtocol_isRejectedWithActionableMessage() {
+        val error = assertThrows(IllegalArgumentException::class.java) {
+            TransferProtocol.decode("""{"type":"TRANSFER_FINISHED"}""".toByteArray())
+        }
+        assertTrue(error.message!!.contains("both devices"))
+    }
+
+    @Test
+    fun futureProtocol_isRejected() {
+        assertThrows(IllegalArgumentException::class.java) {
+            TransferProtocol.decode("""{"type":"DISCONNECT","version":3}""".toByteArray())
+        }
+    }
+
+    @Test
+    fun duplicateRequestIds_areRejected() {
+        assertThrows(IllegalArgumentException::class.java) {
+            TransferProtocol.decode(TransferProtocol.encode(ControlMessage.DownloadRequest(listOf("a", "a"))))
+        }
+    }
+
+    @Test
+    fun negativeSkipCount_isRejected() {
+        assertThrows(IllegalArgumentException::class.java) {
+            TransferProtocol.decode(TransferProtocol.encode(ControlMessage.DownloadRequest(emptyList(), -1)))
+        }
+    }
+
+    @Test
+    fun negativeAcknowledgementCounts_areRejected() {
+        listOf(ControlMessage.TransferResult(-1, 0, 0), ControlMessage.TransferResult(0, -1, 0),
+            ControlMessage.TransferResult(0, 0, -1)).forEach { message ->
+            assertThrows(IllegalArgumentException::class.java) {
+                TransferProtocol.decode(TransferProtocol.encode(message))
+            }
+        }
+    }
+
+    @Test
+    fun unknownMessage_isRejected() {
+        assertThrows(IllegalStateException::class.java) {
+            TransferProtocol.decode("""{"type":"UNKNOWN","version":2}""".toByteArray())
+        }
+    }
+
+    @Test
+    fun malformedPayload_isRejected() {
+        assertThrows(org.json.JSONException::class.java) { TransferProtocol.decode("{".toByteArray()) }
     }
 }
 
@@ -74,6 +150,8 @@ class TransferSessionStateTest {
         assertTrue(
             TransferSessionState(phase = TransferPhase.WaitingForDownloadRequest).isInTransferFlow,
         )
+        assertTrue(TransferSessionState(phase = TransferPhase.WaitingForResult).isInTransferFlow)
+        assertTrue(!TransferSessionState(phase = TransferPhase.WaitingForResult).isTerminal)
         assertTrue(
             TransferSessionState(
                 phase = TransferPhase.Transferring(1, 3, "x", 50),
@@ -88,6 +166,14 @@ class TransferSessionStateTest {
         assertTrue(
             !TransferSessionState(phase = TransferPhase.Idle).isInTransferFlow,
         )
+    }
+
+    @Test
+    fun terminalStates_cannotResumeFromLateProgress() {
+        listOf(TransferPhase.Success(1, 0), TransferPhase.PartialSuccess(1, 0, 1, "Interrupted"),
+            TransferPhase.Failed("No space")).forEach {
+            assertTrue(TransferSessionState(phase = it).isTerminal)
+        }
     }
 
     @Test
@@ -111,6 +197,62 @@ class TransferSessionStateTest {
 }
 
 class TransferFinishLogicTest {
+    @Test
+    fun acknowledgedResult_includesDuplicatesFoundDuringImport() {
+        TransferFinishLogic.validateReceiverResult(ControlMessage.TransferResult(1, 3, 1), requested = 3, skippedAtStart = 2)
+    }
+
+    @Test
+    fun duplicateOnlyAcknowledgement_isValid() {
+        TransferFinishLogic.validateReceiverResult(ControlMessage.TransferResult(0, 4, 0), requested = 0, skippedAtStart = 4)
+    }
+
+    @Test
+    fun incompleteAcknowledgement_isRejected() {
+        assertThrows(IllegalArgumentException::class.java) {
+            TransferFinishLogic.validateReceiverResult(ControlMessage.TransferResult(1, 0, 0), 2, 0)
+        }
+    }
+
+    @Test
+    fun acknowledgement_cannotForgetKnownDuplicates() {
+        assertThrows(IllegalArgumentException::class.java) {
+            TransferFinishLogic.validateReceiverResult(ControlMessage.TransferResult(3, 0, 0), 1, 2)
+        }
+    }
+
+    @Test
+    fun resultSum_doesNotOverflow() {
+        assertThrows(IllegalArgumentException::class.java) {
+            TransferFinishLogic.validateReceiverResult(ControlMessage.TransferResult(Int.MAX_VALUE, Int.MAX_VALUE, 0), 0, 0)
+        }
+    }
+
+    @Test
+    fun receiverFinish_waitsForEveryImport() {
+        assertTrue(
+            !TransferFinishLogic.receiverCanFinishNormally(
+                processed = 1,
+                totalRequested = 2,
+                inflightImports = 0,
+            ),
+        )
+        assertTrue(
+            !TransferFinishLogic.receiverCanFinishNormally(
+                processed = 2,
+                totalRequested = 2,
+                inflightImports = 1,
+            ),
+        )
+        assertTrue(
+            TransferFinishLogic.receiverCanFinishNormally(
+                processed = 2,
+                totalRequested = 2,
+                inflightImports = 0,
+            ),
+        )
+    }
+
     @Test
     fun allProcessedWithImportSkips_isSuccess() {
         val phase = TransferFinishLogic.receiverPhase(
@@ -164,6 +306,21 @@ class TransferFinishLogicTest {
             totalRequested = 0,
         )
         assertTrue(phase is TransferPhase.Success)
+    }
+
+    @Test
+    fun failedBeforeFirstFile_isPartialWithNothingSaved() {
+        val phase = TransferFinishLogic.receiverPhase(0, 0, 0, 0, 2) as TransferPhase.PartialSuccess
+        assertEquals(0, phase.transferred)
+        assertEquals(2, phase.failed)
+    }
+
+    @Test
+    fun explicitFailuresAndInterruptedQueue_areNotDoubleCounted() {
+        val phase = TransferFinishLogic.receiverPhase(1, 3, 1, 2, 4) as TransferPhase.PartialSuccess
+        assertEquals(1, phase.transferred)
+        assertEquals(3, phase.failed)
+        assertEquals(3, phase.skipped)
     }
 
     @Test

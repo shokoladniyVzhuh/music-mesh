@@ -34,7 +34,6 @@ import com.mesh.app.transfer.TransferPhase
 fun SenderWaitScreen(
     onTransferring: () -> Unit,
     onFinished: () -> Unit,
-    onFailedOrClosed: () -> Unit,
     viewModel: TransferViewModel = viewModel(
         factory = (LocalContext.current.applicationContext as MeshApplication).viewModelFactory,
     ),
@@ -43,19 +42,20 @@ fun SenderWaitScreen(
 
     LaunchedEffect(uiState.phase) {
         when (uiState.phase) {
-            is TransferPhase.Transferring -> onTransferring()
+            is TransferPhase.Transferring,
+            is TransferPhase.WaitingForResult,
+            -> onTransferring()
             is TransferPhase.Success,
             is TransferPhase.PartialSuccess,
+            is TransferPhase.Failed,
             -> onFinished()
-            is TransferPhase.Failed -> onFailedOrClosed()
-            is TransferPhase.Idle -> onFailedOrClosed()
+            // Idle is the stateIn placeholder / post-reset — do not treat as cancel.
             else -> Unit
         }
     }
 
     BackHandler {
         viewModel.closeConnection()
-        onFailedOrClosed()
     }
 
     Scaffold(
@@ -66,7 +66,6 @@ fun SenderWaitScreen(
                     IconButton(
                         onClick = {
                             viewModel.closeConnection()
-                            onFailedOrClosed()
                         },
                     ) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -94,7 +93,6 @@ fun SenderWaitScreen(
             TextButton(
                 onClick = {
                     viewModel.closeConnection()
-                    onFailedOrClosed()
                 },
                 modifier = Modifier.fillMaxWidth(),
             ) {

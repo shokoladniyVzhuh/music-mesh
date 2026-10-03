@@ -10,6 +10,9 @@ import com.mesh.app.data.model.toEntity
 import com.mesh.app.transfer.RemoteTrack
 import com.mesh.app.util.FileHasher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.UUID
@@ -36,6 +39,8 @@ class TrackImporter(
     private val trackDao: TrackDao,
     private val metadataReader: MetadataReader,
 ) {
+    private val importMutex = Mutex()
+
     suspend fun importUris(uris: List<Uri>): ImportBatchResult = withContext(Dispatchers.IO) {
         val imported = mutableListOf<Track>()
         val skipped = mutableListOf<String>()
@@ -44,8 +49,16 @@ class TrackImporter(
         val tracksDir = File(context.filesDir, "tracks").apply { mkdirs() }
 
         for (uri in uris) {
-            val displayName = resolveDisplayName(uri)
-            when (val result = importSingle(uri, displayName, tracksDir)) {
+            var displayName = uri.lastPathSegment ?: "track.mp3"
+            val result = try {
+                displayName = resolveDisplayName(uri)
+                importMutex.withLock { importSingle(uri, displayName, tracksDir) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                ImportItemResult.Failed(ImportFailure(displayName, storageError(e)))
+            }
+            when (result) {
                 is ImportItemResult.Success -> imported += result.track
                 is ImportItemResult.SkippedDuplicate -> skipped += result.displayName
                 is ImportItemResult.Failed -> failures += result.failure
@@ -67,9 +80,13 @@ class TrackImporter(
         sourceFile: File,
         remote: RemoteTrack,
     ): ImportItemResult = withContext(Dispatchers.IO) {
+        importMutex.withLock { importReceivedFileLocked(sourceFile, remote) }
+    }
+
+    private suspend fun importReceivedFileLocked(sourceFile: File, remote: RemoteTrack): ImportItemResult {
         val displayName = remote.title
         if (!sourceFile.exists()) {
-            return@withContext ImportItemResult.Failed(
+            return ImportItemResult.Failed(
                 ImportFailure(displayName, "Received file missing"),
             )
         }
@@ -79,21 +96,27 @@ class TrackImporter(
         val destFile = File(tracksDir, "$trackId.mp3")
 
         try {
+            require(remote.fileSize > 0 && sourceFile.length() == remote.fileSize) {
+                "Received file size does not match the catalog"
+            }
+            StoragePolicy.ensureSpace(tracksDir.usableSpace, listOf(remote.fileSize))
             sourceFile.inputStream().use { input ->
-                destFile.outputStream().use { output -> input.copyTo(output) }
+                destFile.outputStream().use { output ->
+                    StoragePolicy.copy(input, output, remote.fileSize, remote.fileSize)
+                }
             }
 
             val hash = FileHasher.sha256(destFile)
             if (!hash.equals(remote.fileHash, ignoreCase = true)) {
                 destFile.delete()
-                return@withContext ImportItemResult.Failed(
+                return ImportItemResult.Failed(
                     ImportFailure(displayName, "Hash mismatch"),
                 )
             }
 
             if (trackDao.getByHash(hash) != null) {
                 destFile.delete()
-                return@withContext ImportItemResult.SkippedDuplicate(displayName)
+                return ImportItemResult.SkippedDuplicate(displayName)
             }
 
             val track = Track(
@@ -108,11 +131,14 @@ class TrackImporter(
                 addedAt = System.currentTimeMillis(),
             )
             trackDao.insert(track.toEntity())
-            ImportItemResult.Success(track)
+            return ImportItemResult.Success(track)
+        } catch (e: CancellationException) {
+            destFile.delete()
+            throw e
         } catch (e: Exception) {
             destFile.delete()
-            ImportItemResult.Failed(
-                ImportFailure(displayName, e.message ?: "P2P import failed"),
+            return ImportItemResult.Failed(
+                ImportFailure(displayName, storageError(e)),
             )
         }
     }
@@ -132,8 +158,12 @@ class TrackImporter(
         val destFile = File(tracksDir, "$trackId.mp3")
 
         return try {
+            val available = tracksDir.usableSpace
+            StoragePolicy.ensureSpace(available, listOf(resolveSize(uri)))
             context.contentResolver.openInputStream(uri)?.use { input ->
-                destFile.outputStream().use { output -> input.copyTo(output) }
+                destFile.outputStream().use { output ->
+                    StoragePolicy.copy(input, output, (available - StoragePolicy.RESERVE_BYTES).coerceAtLeast(0))
+                }
             } ?: return ImportItemResult.Failed(
                 ImportFailure(displayName, "Could not read file"),
             )
@@ -173,10 +203,13 @@ class TrackImporter(
             )
             trackDao.insert(track.toEntity())
             ImportItemResult.Success(track)
+        } catch (e: CancellationException) {
+            destFile.delete()
+            throw e
         } catch (e: Exception) {
             destFile.delete()
             ImportItemResult.Failed(
-                ImportFailure(displayName, e.message ?: "Import failed"),
+                ImportFailure(displayName, storageError(e)),
             )
         }
     }
@@ -189,6 +222,23 @@ class TrackImporter(
             }
         }
         return uri.lastPathSegment ?: "track.mp3"
+    }
+
+    private fun resolveSize(uri: Uri): Long {
+        context.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null)
+            ?.use { cursor ->
+                if (cursor.moveToFirst() && !cursor.isNull(0)) return cursor.getLong(0).coerceAtLeast(0)
+            }
+        return 0L
+    }
+
+    private fun storageError(error: Exception): String {
+        if (generateSequence<Throwable>(error) { it.cause }.any {
+                it is NotEnoughSpaceException ||
+                    it.message?.contains("ENOSPC", ignoreCase = true) == true
+            }
+        ) return "Not enough storage space. Free up space and try again."
+        return error.message ?: "Could not save track"
     }
 
     private fun isMp3(uri: Uri, displayName: String): Boolean {

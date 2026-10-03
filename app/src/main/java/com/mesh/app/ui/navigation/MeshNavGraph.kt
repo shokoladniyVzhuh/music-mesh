@@ -165,7 +165,6 @@ fun MeshNavGraph(modifier: Modifier = Modifier) {
                         popUpTo(Routes.SENDER_WAIT) { inclusive = true }
                     }
                 },
-                onFailedOrClosed = { navigateHomeClearingTransfer() },
             )
         }
         composable(Routes.RECEIVER_PICK) {
@@ -180,7 +179,6 @@ fun MeshNavGraph(modifier: Modifier = Modifier) {
                         popUpTo(Routes.RECEIVER_PICK) { inclusive = true }
                     }
                 },
-                onFailedOrClosed = { navigateHomeClearingTransfer() },
             )
         }
         composable(Routes.TRANSFER_PROGRESS) {
